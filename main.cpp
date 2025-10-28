@@ -50,9 +50,11 @@ public:
             for(int j = 0; j < std::min(cols, 5); j++) {
                 std::cout << data[i][j] << "\t";
             }
-            if (cols > 5) std::cout << "...\n";
-            std::cout << std::endl;
+            if (cols > 5) std::cout << "...";
+            std::cout << "\n";
         }
+        if (rows > 5) std::cout << "...\n";
+        std::cout << std::endl;
     }
 };
 
@@ -63,6 +65,49 @@ struct ComputeTask {
         blocks.emplace_back(row, col);
     }
 };
+
+void sequentialMultiply(const Matrix& A, const Matrix& B, Matrix& C) {
+    for (int i = 0; i < A.getRows(); i++) {
+        for(int j = 0; j < B.getCols(); j++) {
+            C(i, j) = 0;
+            for (int k = 0; k < A.getCols(); k++) {
+                C(i, j) += A(i, k) * B(k, j);
+            }
+        }
+    }
+}
+
+void multiplyBlock(const Matrix& A, const Matrix& B, Matrix& C, int blockRow, int blockCol, int blockSize = 2) {
+    int startRow = blockRow * blockSize;
+    int startCol = blockCol * blockSize;
+
+    int endRow = std::min(startRow + blockSize, C.getRows());
+    int endCol = std::min(startCol + blockSize, C.getCols());
+
+    std::cout << "Вычисление блока (" << blockRow << "," << blockCol << "): "
+              << "строки " << startRow << "-" << endRow-1 << ", "
+              << "столбцы " << startCol << "-" << endCol-1 << std::endl;
+
+    for (int i = startRow; i < endRow; i++) {
+        for(int j = startCol; j < endCol; j++) {
+            C(i, j) = 0;
+            for(int k = 0; k < A.getCols(); k++) {
+                C(i, j) += A(i,k) * B(k, j);
+            }
+        }
+    }
+}
+
+void processTask(const ComputeTask& task, const Matrix& A, const Matrix& B, Matrix& C, int blockSize = 2) {
+    if (task.blocks.empty()) {
+        std::cout << "Предупреждение: пустая задача!" << std::endl;
+        return;
+    }
+
+    for(const auto& block : task.blocks) {
+        multiplyBlock(A, B, C, block.first, block.second, blockSize);
+    }
+}
 
 void initializeMatrices(Matrix& A, Matrix& B, Matrix& C) {
     A.fillRandom();
