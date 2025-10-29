@@ -5,6 +5,7 @@
 #include <future>
 #include <random>
 #include <algorithm>
+#include <fstream>
 
 enum ParallelMethods {
     THREADS,
@@ -43,19 +44,6 @@ public:
             }
         }
     }
-
-    void print(const std::string& name = "Matrix") const {
-        std::cout << name << " (" << rows << "x" << cols << "):\n";
-        for(int i = 0; i < std::min(rows, 5); i++) {
-            for(int j = 0; j < std::min(cols, 5); j++) {
-                std::cout << data[i][j] << "\t";
-            }
-            if (cols > 5) std::cout << "...";
-            std::cout << "\n";
-        }
-        if (rows > 5) std::cout << "...\n";
-        std::cout << std::endl;
-    }
 };
 
 struct ComputeTask {
@@ -84,10 +72,6 @@ void multiplyBlock(const Matrix& A, const Matrix& B, Matrix& C, int blockRow, in
     int endRow = std::min(startRow + blockSize, C.getRows());
     int endCol = std::min(startCol + blockSize, C.getCols());
 
-    std::cout << "Вычисление блока (" << blockRow << "," << blockCol << "): "
-              << "строки " << startRow << "-" << endRow-1 << ", "
-              << "столбцы " << startCol << "-" << endCol-1 << std::endl;
-
     for (int i = startRow; i < endRow; i++) {
         for(int j = startCol; j < endCol; j++) {
             C(i, j) = 0;
@@ -100,7 +84,6 @@ void multiplyBlock(const Matrix& A, const Matrix& B, Matrix& C, int blockRow, in
 
 void processTask(const ComputeTask& task, const Matrix& A, const Matrix& B, Matrix& C, int blockSize = 2) {
     if (task.blocks.empty()) {
-        std::cout << "Предупреждение: пустая задача!" << std::endl;
         return;
     }
 
@@ -109,33 +92,172 @@ void processTask(const ComputeTask& task, const Matrix& A, const Matrix& B, Matr
     }
 }
 
-void initializeMatrices(Matrix& A, Matrix& B, Matrix& C) {
-    A.fillRandom();
-    B.fillRandom();
+std::vector<ComputeTask> createTasks(int rows, int cols, int numThreads, int blockSize = 2) {
+    std::vector<ComputeTask> tasks(numThreads);
+
+    int blocksRows = (rows + blockSize - 1) / blockSize;
+    int blocksCols = (cols + blockSize - 1) / blockSize;
+    int totalBlocks = blocksRows * blocksCols;
+
+    for(int blockIndex = 0; blockIndex < totalBlocks; blockIndex++) {
+        int blockRow = blockIndex / blocksCols;
+        int blockCol = blockIndex % blocksCols;
+        int taskIndex = blockIndex % numThreads;
+
+        tasks[taskIndex].addBlock(blockRow, blockCol);
+    }
+
+    return tasks;
+}
+
+void multiplyWithThreads(const Matrix& A, const Matrix& B, Matrix& C,
+                         const std::vector<ComputeTask>& tasks, int blockSize = 2) {
+    std::vector<std::thread> threads;
+
+    for(int i = 0; i < tasks.size() - 1; i++) {
+        threads.emplace_back(processTask, std::cref(tasks[i]), std::cref(A), std::cref(B), std::ref(C), blockSize);
+    }
+
+    processTask(tasks[tasks.size() - 1], A, B, C, blockSize);
+
+    for(auto& thread : threads) {
+        thread.join();
+    }
+}
+
+template<typename Func>
+long long measureTime(Func&& func) {
+    auto start = std::chrono::high_resolution_clock::now();
+    func();
+    auto end = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+void multiplyWithAsync(const Matrix& A, const Matrix& B, Matrix& C,
+                       const std::vector<ComputeTask>& tasks, int blockSize = 2) {
+    std::vector<std::future<void>> futures;
+
+    for(int i = 0; i < tasks.size(); i++) {
+        futures.push_back(
+                std::async(std::launch::async, processTask,
+                           std::cref(tasks[i]), std::cref(A), std::cref(B), std::ref(C), blockSize)
+        );
+    }
+
+    for(auto& future : futures) {
+        future.wait();
+    }
+}
+
+void compareMethods(int matrixSize, int numThreads, int blockSize, std::ofstream& outputFile) {
+    Matrix A(matrixSize, matrixSize);
+    Matrix B(matrixSize, matrixSize);
+    Matrix C_seq(matrixSize, matrixSize);
+    Matrix C_threads(matrixSize, matrixSize);
+    Matrix C_async(matrixSize, matrixSize);
+
+    A.fillRandom(1, 100);
+    B.fillRandom(1, 100);
+
+    auto tasks = createTasks(matrixSize, matrixSize, numThreads, blockSize);
+
+    // 1. Последовательное умножение
+    long long timeSeq = measureTime([&]() {
+        sequentialMultiply(A, B, C_seq);
+    });
+
+    // 2. Многопоточное с std::thread
+    long long timeThreads = measureTime([&]() {
+        multiplyWithThreads(A, B, C_threads, tasks, blockSize);
+    });
+
+    // 3. Асинхронное с std::async
+    long long timeAsync = measureTime([&]() {
+        multiplyWithAsync(A, B, C_async, tasks, blockSize);
+    });
+
+    // Проверка корректности
+    bool threadsCorrect = true;
+    bool asyncCorrect = true;
+
+    for (int i = 0; i < matrixSize; i++) {
+        for (int j = 0; j < matrixSize; j++) {
+            if (C_threads(i, j) != C_seq(i, j)) threadsCorrect = false;
+            if (C_async(i, j) != C_seq(i, j)) asyncCorrect = false;
+        }
+    }
+
+    // Запись в файл
+    outputFile << matrixSize << "x" << matrixSize << ","
+               << numThreads << "," << blockSize << ","
+               << timeSeq << "," << timeThreads << "," << timeAsync << ","
+               << (double)timeSeq / timeThreads << "," << (double)timeSeq / timeAsync << ","
+               << (threadsCorrect ? "YES" : "NO") << "," << (asyncCorrect ? "YES" : "NO") << std::endl;
+
+    // Вывод в консоль для прогресса
+    std::cout << "Матрица " << matrixSize << "x" << matrixSize
+              << ", Потоков: " << numThreads << ", Блок: " << blockSize
+              << " -> Seq: " << timeSeq << " мкс, Threads: " << timeThreads
+              << " мкс, Async: " << timeAsync << " мкс" << std::endl;
+}
+
+void testThreadScaling(int matrixSize, int blockSize, std::ofstream& outputFile) {
+    std::cout << "\n--- Масштабирование по потокам (матрица " << matrixSize << "x" << matrixSize << ") ---" << std::endl;
+
+    std::vector<int> threadCounts = {1, 2, 4, 8, 16};
+
+    for (int threads : threadCounts) {
+        compareMethods(matrixSize, threads, blockSize, outputFile);
+    }
+}
+
+void testBlockSizeScaling(int matrixSize, int numThreads, std::ofstream& outputFile) {
+    std::cout << "\n--- Масштабирование по размеру блока (матрица " << matrixSize << "x" << matrixSize << ", " << numThreads << " потоков) ---" << std::endl;
+
+    std::vector<int> blockSizes = {2, 4, 8, 16, 32, 64, 128};
+
+    for (int blockSize : blockSizes) {
+        compareMethods(matrixSize, numThreads, blockSize, outputFile);
+    }
 }
 
 int main() {
-    std::cout << "=== Шаг 0: Подготовка структур данных ===" << std::endl;
+    std::cout << "=== Тестирование производительности ===" << std::endl;
 
-    Matrix A(4, 4);
-    Matrix B(4, 4);
-    Matrix C(4, 4);
+    // Открываем файл для записи
+    std::ofstream outputFile("compare.txt");
+    if (!outputFile.is_open()) {
+        std::cerr << "Ошибка открытия файла!" << std::endl;
+        return 1;
+    }
 
-    initializeMatrices(A, B, C);
+    // Заголовок CSV
+    outputFile << "MatrixSize,Threads,BlockSize,SequentialTime,ThreadsTime,AsyncTime,ThreadsSpeedup,AsyncSpeedup,ThreadsCorrect,AsyncCorrect" << std::endl;
 
-    A.print("Matrix A");
-    B.print("Matrix B");
-    C.print("Matrix C (result)");
+    // ТЕСТ 1: Масштабирование по потокам для разных размеров матриц
+    std::cout << "\n=== ТЕСТ 1: Зависимость от количества потоков ===" << std::endl;
 
-    ComputeTask task;
-    task.addBlock(0, 0);
-    task.addBlock(0, 1);
-    task.addBlock(1, 0);
-    task.addBlock(1, 1);
+    std::vector<int> matrixSizes = {100, 200, 500};
+    for (int size : matrixSizes) {
+        int optimalBlockSize = (size >= 500) ? 32 : (size >= 200 ? 16 : 8);
+        testThreadScaling(size, optimalBlockSize, outputFile);
+    }
 
+    // ТЕСТ 2: Масштабирование по размеру блока для разных конфигураций
+    std::cout << "\n=== ТЕСТ 2: Зависимость от размера блока ===" << std::endl;
 
-    std::cout << "Создана задача с " << task.blocks.size() << " блоками." << std::endl;
+    // Для маленькой матрицы
+    testBlockSizeScaling(100, 4, outputFile);
+
+    // Для средней матрицы
+    testBlockSizeScaling(200, 8, outputFile);
+
+    // Для большой матрицы
+    testBlockSizeScaling(500, 8, outputFile);
+
+    outputFile.close();
+    std::cout << "\nРезультаты сохранены в файл compare.txt" << std::endl;
+    std::cout << "Формат CSV: MatrixSize,Threads,BlockSize,SequentialTime,ThreadsTime,AsyncTime,ThreadsSpeedup,AsyncSpeedup,ThreadsCorrect,AsyncCorrect" << std::endl;
 
     return 0;
-
 }
